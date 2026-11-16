@@ -45,15 +45,26 @@ outputs/              created by main.py, not versioned: figures/, artifacts/ (m
 
 ## Method
 
-1. **EDA and split**: `src/eda.py` checks the file first (no duplicates, ranges, `unknown` and `pdays = -1` as hidden missing values,
-   outliers kept and log-transformed, link of each column with the target, time drift). Then a stratified 60/20/20 split. Train is used for fitting, 5-fold CV and Optuna. Validation is used for model choice,
+1. **Split, then EDA**: stratified 60/20/20 split first. `src/eda.py` runs the data-quality checks on the whole file
+   (no duplicates, valid ranges, consistent columns) and everything that can guide a choice on the **training set only**
+   (hidden missing values `unknown` / `pdays = -1`, outliers kept and log-transformed, link of each column with the target, drift). Train is used for fitting, 5-fold CV and Optuna. Validation is used for model choice,
    the business threshold and the fairness thresholds. Test is used **once**, at the end.
 2. **Leakage**: `duration` is known only after the call, so it is dropped inside the Pipeline. LightGBM CV ROC-AUC falls from 0.930 to 0.785.
 3. **Features**: `prev_contacted`, `pdays_clean`, `log_balance`, `log_campaign`, `any_loan`, plus one-hot encoding and scaling.
 4. **Imbalance**: `class_weight="balanced"`, measured with PR-AUC (random baseline = 0.117).
 5. **Models**: Logistic Regression (Elastic Net), Random Forest and LightGBM, all compared with the same metrics.
 6. **Tuning**: Optuna, 30 trials per model, objective = mean 5-fold CV PR-AUC on train. Every trial goes to `run_log/run_log.csv`.
-7. **SHAP**, **calibration** (isotonic), **cost-based threshold** and **fairness** audit on age with a post-processing mitigation.
+7. **SHAP**, **calibration** (isotonic, verdict read bin by bin on the reliability curve), **cost-based threshold** and
+   **fairness** audit on age with a post-processing mitigation (profit cost and bootstrap confidence intervals reported).
+8. **Checks reported, never used for a choice**: the same model re-fitted on train + validation (refit check), and a temporal
+   check trained on the oldest 80% of the file **without any test row** and evaluated on the newest 20%.
+
+Why the validation set is used for three choices (model, business threshold, fairness thresholds) and why the headline model is
+not re-fitted on train + validation: those thresholds must be read on predictions of a model that never saw the validation rows.
+The test set stays untouched until the end; the refit check shows what a refit would change.
+
+**API note**: `POST /predict` takes the 15 pre-call columns. `duration` is filled with 0 only because the fitted Pipeline expects
+the 16 raw columns; its first step deletes `duration`, so the value is never used (`tests/test_api.py` checks it).
 
 ## Key results (untouched test set, 9,043 clients)
 
