@@ -47,7 +47,11 @@ def health():
 @app.post("/predict")
 def predict(client: Client):
     row = client.model_dump()
-    row["duration"] = 0          # placeholder column, dropped inside the Pipeline (leakage)
+    # `duration` (length of the call) is only known AFTER the call, so the client never sends it.
+    # The fitted Pipeline still expects the 16 raw columns in the same order, and its first step
+    # (FeatureEngineer) deletes `duration` before anything else. So we fill it with 0: the value
+    # is never read, and changing it does not change the prediction (checked in tests/test_api.py).
+    row["duration"] = 0
     X = pd.DataFrame([row])[UCI_NAMES]
     p = float(MODEL.predict_proba(X)[0, 1])
     t = DECISION["threshold"]

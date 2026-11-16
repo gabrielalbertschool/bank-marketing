@@ -27,5 +27,15 @@ def test_predict():
     print(body)
 
 
+def test_duration_placeholder_is_ignored():
+    """The 0 put in `duration` by the API is dropped by the Pipeline: any value gives the same probability."""
+    import pandas as pd
+    from src.data import UCI_NAMES
+    from src.serve import MODEL
+    rows = pd.DataFrame([{**CLIENT, "duration": d} for d in (0, 300, 3000)])[UCI_NAMES]
+    p = MODEL.predict_proba(rows)[:, 1]
+    assert abs(p.max() - p.min()) < 1e-12
+
+
 if __name__ == "__main__":
-    test_health(); test_predict(); print("API smoke tests passed")
+    test_health(); test_predict(); test_duration_placeholder_is_ignored(); print("API smoke tests passed")
