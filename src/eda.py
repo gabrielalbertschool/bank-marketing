@@ -3,6 +3,10 @@
 Everything we look at before trusting the data: duplicates, ranges, hidden missing values,
 cardinality, outliers, links with the target, time drift. Each step prints a short line,
 saves its table in outputs/results/eda/ and returns the key numbers for results.json.
+
+Data-quality checks (duplicates, ranges, consistency) look at the whole file, because a duplicate
+across train and test would be a leak. Everything that can guide a modelling choice (distributions,
+outliers, links with the target, correlations) is computed on the TRAINING set only.
 """
 from __future__ import annotations
 
@@ -159,25 +163,27 @@ def _figures(X, y, num, assoc, fig_dir):
     _save_fig(fig, fig_dir / "eda_association.png")
 
 
-def run_eda(X, y, results_dir, fig_dir, seed=42) -> dict:
-    """Run every check, print a short report, save tables and figures, return the key numbers."""
+def run_eda(X, y, results_dir, fig_dir, seed=42, X_full=None, y_full=None) -> dict:
+    """X, y = training set. X_full, y_full = whole file, used only for the data-quality checks."""
     out = results_dir / "eda"
     out.mkdir(parents=True, exist_ok=True)
     num = [c for c in X.columns if c not in CATEGORICAL]
+    Xq, yq = (X_full, y_full) if X_full is not None else (X, y)
 
-    ov = overview(X, y)
-    print(f"[EDA] {ov['n_rows']:,} rows x {ov['n_columns']} columns, {ov['memory_mb']} MB, types {ov['dtypes']}")
+    ov = overview(Xq, yq)
+    print(f"[EDA] whole file: {ov['n_rows']:,} rows x {ov['n_columns']} columns, {ov['memory_mb']} MB, types {ov['dtypes']}")
 
-    dup = duplicates(X, y)
-    print(f"[EDA] duplicates: {dup}")
+    dup = duplicates(Xq, yq)
+    print(f"[EDA] whole file, duplicates: {dup}")
 
-    checks = range_checks(X)
+    checks = range_checks(Xq)
     bad = [k for k, ok in checks.items() if not ok]
-    print(f"[EDA] range checks: {len(checks) - len(bad)}/{len(checks)} ok" + (f", failing: {bad}" if bad else ""))
+    print(f"[EDA] whole file, range checks: {len(checks) - len(bad)}/{len(checks)} ok" + (f", failing: {bad}" if bad else ""))
 
-    table, mismatch = previous_campaign_consistency(X)
+    table, mismatch = previous_campaign_consistency(Xq)
     table.to_csv(out / "previous_campaign_consistency.csv")
-    print(f"[EDA] pdays / previous / poutcome disagree on {mismatch} rows")
+    print(f"[EDA] whole file, pdays / previous / poutcome disagree on {mismatch} rows")
+    print(f"[EDA] from here on: training set only ({len(X):,} rows), so no test row guides a choice")
 
     n_nan, never_share, unk = missing_values(X)
     unk.to_csv(out / "unknown_values.csv")
@@ -217,7 +223,8 @@ def run_eda(X, y, results_dir, fig_dir, seed=42) -> dict:
 
     _figures(X, y, num, assoc, fig_dir)
 
-    return {"overview": ov, "duplicates": dup, "range_checks": checks,
+    return {"computed_on": {"quality_checks": "whole file", "everything_else": f"train only ({len(X)} rows)"},
+            "overview": ov, "duplicates": dup, "range_checks": checks,
             "previous_campaign_mismatch_rows": mismatch, "nan": n_nan,
             "max_levels": int(card["levels"].max()),
             "outlier_share": outliers["share"].round(4).to_dict(),

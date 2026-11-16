@@ -1,8 +1,8 @@
 """End-to-end entry point: python main.py  (add --trials N for a quicker run).
 
-Stages: EDA -> split -> leakage check -> imbalance ablation -> baselines -> Optuna tuning
+Stages: data -> split -> EDA (train only) -> leakage check -> imbalance ablation -> baselines -> Optuna tuning
 (3 models) -> model selection -> calibration -> business threshold -> test evaluation (once)
--> SHAP -> fairness audit + mitigation -> temporal robustness -> save model for serving.
+-> refit check on train+val -> SHAP -> fairness audit + mitigation -> temporal robustness -> save model for serving.
 """
 from __future__ import annotations
 
@@ -55,23 +55,28 @@ def main(n_trials=None):
     # ---------------- 1. data + EDA ----------------
     X, y, source = load_data(cfg)
     print(f"[1] data: {X.shape} from {source}; positive rate {y.mean():.4f}")
-    unknown = {c: float((X[c] == "unknown").mean()) for c in CATEGORICAL}
     R["data"] = {"source": source, "n_rows": len(X), "n_features": X.shape[1],
                  "positive_rate": float(y.mean()), "n_positive": int(y.sum()),
-                 "missing_nan": int(X.isna().sum().sum()),
-                 "unknown_share": {k: v for k, v in unknown.items() if v > 0},
-                 "pdays_never_contacted_share": float((X["pdays"] == -1).mean()),
-                 "duration_median_by_class": X.groupby(y)["duration"].median().to_dict(),
-                 "rate_by_poutcome": X.assign(y=y).groupby("poutcome")["y"].mean().to_dict(),
-                 "rate_first_half_rows": float(y[: len(y) // 2].mean()),
-                 "rate_last_10pct_rows": float(y[int(.9 * len(y)):].mean())}
-    plots.eda(X, y, FIG)
-    R["eda"] = run_eda(X, y, RES, FIG, seed)
+                 "missing_nan": int(X.isna().sum().sum())}
 
+    # split FIRST: every statistic that can guide a choice is computed on train only
     X_tr, X_va, X_te, y_tr, y_va, y_te = split_data(X, y, cfg)
     R["split"] = {n: {"n": len(s), "positive_rate": float(s.mean())}
                   for n, s in [("train", y_tr), ("val", y_va), ("test", y_te)]}
     print(f"[1] split train/val/test = {len(X_tr)}/{len(X_va)}/{len(X_te)}")
+
+    # EDA on train only (rows kept in file order, so the drift along the file is still visible)
+    tr = X_tr.sort_index(); ytr = y_tr.loc[tr.index]
+    unknown = {c: float((tr[c] == "unknown").mean()) for c in CATEGORICAL}
+    R["data"].update({"eda_on": "train only",
+                      "unknown_share": {k: v for k, v in unknown.items() if v > 0},
+                      "pdays_never_contacted_share": float((tr["pdays"] == -1).mean()),
+                      "duration_median_by_class": tr.groupby(ytr)["duration"].median().to_dict(),
+                      "rate_by_poutcome": tr.assign(y=ytr).groupby("poutcome")["y"].mean().to_dict(),
+                      "rate_first_half_rows": float(ytr.iloc[: len(ytr) // 2].mean()),
+                      "rate_last_10pct_rows": float(ytr.iloc[int(.9 * len(ytr)):].mean())})
+    plots.eda(tr, ytr, FIG)
+    R["eda"] = run_eda(tr, ytr, RES, FIG, seed, X_full=X, y_full=y)
 
     # ---------------- 2. leakage: duration ----------------
     leak = {}
@@ -160,12 +165,25 @@ def main(n_trials=None):
                  "calibrated_at_business_t": compute_metrics(y_te, p_te, t_star)}
     R["test_all_models"] = {n: compute_metrics(y_te, tuned[n].predict_proba(X_te)[:, 1]) for n in MODEL_NAMES}
     rt_raw, rt_cal = reliability_table(y_te, p_te_raw), reliability_table(y_te, p_te)
-    def verdict(p):  # over-confident = predicts more "yes" than observed in the bins that matter
-        gap = float(np.mean(p) - y_te.mean())
-        return "over-confident (probabilities too high)" if gap > 0.01 else (
-            "under-confident (probabilities too low)" if gap < -0.01 else "well calibrated on average")
+    def verdict(table, min_count=30):
+        """Bin-by-bin reading of the reliability curve (only bins with at least `min_count` clients)."""
+        rows = [r for r in table if r["count"] >= min_count]
+        n = sum(r["count"] for r in rows)
+        gaps_ = [r["mean_pred"] - r["frac_pos"] for r in rows]
+        over, under = sum(g > 0.02 for g in gaps_), sum(g < -0.02 for g in gaps_)
+        weighted = sum(r["count"] * abs(g) for r, g in zip(rows, gaps_)) / n
+        if over > len(rows) / 2:
+            label = "over-confident (probabilities too high)"
+        elif under > len(rows) / 2:
+            label = "under-confident (probabilities too low)"
+        else:
+            label = "well calibrated"
+        return {"label": label, "bins_used": len(rows), "bins_over": int(over), "bins_under": int(under),
+                "weighted_abs_gap": float(weighted), "max_abs_gap": float(max(abs(g) for g in gaps_))}
     R["test_ci95"] = {k: bootstrap_ci(y_te, p_te, k, seed=seed) for k in ("roc_auc", "pr_auc", "brier")}
-    R["calibration_test"] = {"verdict_raw": verdict(p_te_raw), "verdict_calibrated": verdict(p_te),
+    v_raw, v_cal = verdict(rt_raw), verdict(rt_cal)
+    R["calibration_test"] = {"verdict_raw": v_raw["label"], "verdict_calibrated": v_cal["label"],
+                             "bins_raw": v_raw, "bins_calibrated": v_cal,
                              "raw_table": rt_raw, "cal_table": rt_cal,
                              "raw_mean_pred": float(p_te_raw.mean()), "cal_mean_pred": float(p_te.mean()),
                              "observed_rate": float(y_te.mean())}
@@ -185,6 +203,17 @@ def main(n_trials=None):
     print(f"[8] test: {json.dumps({k: round(v, 4) for k, v in R['test']['calibrated'].items()})}")
     print(f"[8] profit test: model {R['business']['test']['model']['profit']:.0f} EUR vs call-all "
           f"{R['business']['test']['call_everyone']['profit']:.0f} EUR")
+
+    # refit check: same hyper-parameters, calibrated model re-fitted on train + validation.
+    # Not the headline model: the business and fairness thresholds were chosen on validation
+    # predictions, which needs a model that never saw validation. This only measures what we lose.
+    X_tv, y_tv = pd.concat([X_tr, X_va]), pd.concat([y_tr, y_va])
+    cal_tv = CalibratedClassifierCV(clone(raw), method="isotonic", cv=cv, n_jobs=-1).fit(X_tv, y_tv)
+    p_te_tv = cal_tv.predict_proba(X_te)[:, 1]
+    R["refit_check"] = {"train_rows": len(X_tv), **compute_metrics(y_te, p_te_tv),
+                        "profit_at_t": profit(y_te, p_te_tv, t_star, cost, gain)["profit"]}
+    print(f"[8] refit on train+val: test PR-AUC {R['refit_check']['pr_auc']:.4f} "
+          f"(headline {R['test']['calibrated']['pr_auc']:.4f})")
 
     # ---------------- 9. SHAP ----------------
     Xs = X_te.sample(2000, random_state=seed)
@@ -231,17 +260,34 @@ def main(n_trials=None):
         tb = pd.Series((p_te[i] >= t_star)[yv[i] == 1]).groupby(gv[i][yv[i] == 1]).mean()
         ta = pd.Series(dec_after[i][yv[i] == 1]).groupby(gv[i][yv[i] == 1]).mean()
         eo_b.append(tb.max() - tb.min()); eo_a.append(ta.max() - ta.min())
+    dec_before = p_te >= t_star
+    cost_b = []
+    for _ in range(1000):
+        i = rng.integers(0, len(yv), len(yv))
+        pb = gain * (dec_before[i] & (yv[i] == 1)).sum() - cost * dec_before[i].sum()
+        pa = gain * (dec_after[i] & (yv[i] == 1)).sum() - cost * dec_after[i].sum()
+        cost_b.append(pb - pa)
+    R["fairness"]["profit_cost"] = float(R["fairness"]["profit_before"] - prof_after)
+    R["fairness"]["profit_cost_share"] = float(R["fairness"]["profit_cost"] / R["fairness"]["profit_before"])
+    R["fairness"]["profit_cost_ci95"] = [float(np.percentile(cost_b, 2.5)), float(np.percentile(cost_b, 97.5))]
+    R["fairness"]["test_group_sizes"] = before.set_index("group")[["n", "positives"]].to_dict("index")
     R["fairness"]["eo_gap_ci95_before"] = [float(np.percentile(eo_b, 2.5)), float(np.percentile(eo_b, 97.5))]
     R["fairness"]["eo_gap_ci95_after"] = [float(np.percentile(eo_a, 2.5)), float(np.percentile(eo_a, 97.5))]
     plots.fairness_plot(before, after, FIG / "fairness_age.png")
     print("[10] fairness before:\n", before.round(3), "\n after:\n", after.round(3))
 
     # ---------------- 11. temporal robustness (extra, not used for any choice) ----------------
+    # train on the oldest 80% of the file WITHOUT any row of our test set, evaluate on the newest 20%
     cut = int(.8 * len(X))
-    tp = make_pipeline(best, X, R["tuning"][best]["best_params"], seed=seed, drop=drop).fit(X.iloc[:cut], y.iloc[:cut])
-    R["temporal_check"] = {"train_rows": cut, "test_rows": len(X) - cut,
-                           "test_positive_rate": float(y.iloc[cut:].mean()),
-                           **compute_metrics(y.iloc[cut:], tp.predict_proba(X.iloc[cut:])[:, 1])}
+    old = X.index[:cut].difference(X_te.index)
+    new = X.index[cut:]
+    tp = make_pipeline(best, X, R["tuning"][best]["best_params"], seed=seed, drop=drop).fit(X.loc[old], y.loc[old])
+    R["temporal_check"] = {"train_rows": len(old), "test_rows": len(new),
+                           "train_positive_rate": float(y.loc[old].mean()),
+                           "test_positive_rate": float(y.loc[new].mean()),
+                           **compute_metrics(y.loc[new], tp.predict_proba(X.loc[new])[:, 1])}
+    print(f"[11] temporal check: ROC-AUC {R['temporal_check']['roc_auc']:.3f} on the newest 20% "
+          f"(trained on {len(old)} older rows, none from the test set)")
 
     # ---------------- 12. save for serving ----------------
     joblib.dump(cal, ART / "final_model.joblib")
