@@ -1,0 +1,31 @@
+# Central configuration of the Bank Marketing project (Applied ML, MSA-DATI07-05)
+seed: 42
+
+data:
+  openml_id: 1461               # Option 2 of the project instructions
+  local_fallback: data/bank-full.csv   # identical UCI "bank-full" file, used only if OpenML is unreachable
+  test_size: 0.20               # untouched test set, used once at the very end
+  val_size: 0.20                # validation set (fraction of the full data)
+
+features:
+  drop_leaky: [duration]        # known only AFTER the call -> target leakage
+
+tuning:
+  n_trials: 30                  # Optuna trials per model
+  cv_folds: 5                   # StratifiedKFold inside the training set
+  metric: average_precision     # PR-AUC, robust to the 11.7% positive rate
+
+business:
+  cost_per_call: 5.0            # EUR, assumed fully-loaded cost of one phone call
+  gain_per_subscription: 50.0   # EUR, assumed net margin of one term deposit subscription
+
+fairness:
+  sensitive: age
+  bins: [0, 25, 60, 200]        # groups: <25, 25-60, >60
+  labels: ["<25", "25-60", ">60"]
+
+paths:                          # everything under outputs/ is generated and git-ignored
+  artifacts: outputs/artifacts  # models (.joblib), Optuna study DB, decision.json
+  figures: outputs/figures      # every plot of the report
+  results: outputs/results      # results.json = every number quoted in the report
+  run_log: run_log              # committed: run_log.csv = one row per Optuna trial (requirement 7)
